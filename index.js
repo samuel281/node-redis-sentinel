@@ -38,6 +38,49 @@ function resolveMasterFromSentinel(endpoint, masterName, callback) {
     });
 }
 
+function parseSentinelResponse(resArr){
+    var response = {};
+    for(var i = 0 ; i < resArr.length ; i+=2){
+        response[resArr[i]] = resArr[i+1];
+    }
+    return response;
+}
+
+function resolveSlaveFromSentinel(endpoint, masterName, callback){
+    var sentinelClient = redis.createClient(endpoint.port, endpoint.host);
+    var callbackSent = false;
+
+    // If there is an error then callback with it
+    sentinelClient.on("error", function(err) {
+        if (!callbackSent) {
+            callbackSent = true;
+            callback(err);
+        }
+    });
+
+    sentinelClient.send_command('SENTINEL', ['slaves', masterName], function(err, result) {
+        if (callbackSent) { return; }
+        callbackSent = true;
+
+        if (err) { return callback(err); }
+
+        // Test the response
+        if (result === null) {
+            callback(new Error("Unkown master name: " + masterName));
+        } else if(result.length == 0){
+            callback(new Error("No slaves linked to the master."));
+        } 
+        else {
+            var slaveInfoArr = result[Math.floor(Math.random() * result.length)]; //range 0 to result.length -1
+            if((slaveInfoArr.length % 2) > 0){
+                callback(new Error("Corrupted response from the sentinel"));
+            }
+            var slaveInfo = parseSentinelResponse(slaveInfoArr);
+            callback(null, slaveInfo.ip, slaveInfo.port);
+        }
+    });   
+}
+
 /**
  * [createClient description]
  * @param  {[type]} endpoints  [description]
@@ -97,57 +140,149 @@ function createClient(endpoints, masterName, options) {
         });
     }
 
+    function resolveSlave(callback){
+        var promise = Q.resolve();
+
+        // Because finding the master is going to be an async list we will terminate
+        // when we find one then use promises...
+        promise = endpoints.reduce(function(soFar, endpoint) {
+            return soFar.then(function() {
+                var deferred = Q.defer();
+                resolveSlaveFromSentinel(endpoint, masterName, function(err, ip, port) {
+                    if (err) {
+                        // We received an error so resolve our deferred to move onto the
+                        // next endpoint - maybe log or something here...
+                        deferred.resolve();
+                    } else {
+                        // We have an IP/port for our master - stick this endpoint on top
+                        // of our list of endpoints
+                        var index = endpoints.indexOf(endpoint);
+                        endpoints.splice(index, 1);
+                        endpoints.unshift(endpoint);
+
+                        // TODO - we could also fetch all the sentinels for this master from this
+                        // responding sentinel and update the endpoints array.
+
+                        // Callback with the IP address
+                        callback(null, ip, port);
+                    }
+                });
+                return deferred.promise;
+            });
+        }, promise);
+
+        promise.then(function() {
+            // If we've got this far then we've failed to find a master from any
+            // of the sentinels. Callback with an error.
+            callback(new Error('Failed to find a slave from any of the sentinels'));
+        });
+    }
+
     var netClient = new net.Socket();
     var redisClient = new redis.RedisClient(netClient, options);
 
-    // Resolve the master redis server from the sentinel endpoints
-    resolveMaster(function(err, ip, port) {
-        if (err) { redisClient.emit('error', err); }
+    
+    if(options && options.role && options.role == 'slave'){
+        // Resolve the master redis server from the sentinel endpoints
+        resolveSlave(function(err, ip, port) {
+            if (err) { redisClient.emit('error', err); }
 
-        redisClient.port = port;
-        redisClient.host = ip;
-        redisClient.stream.connect(port, ip);
+            redisClient.port = port;
+            redisClient.host = ip;
+            redisClient.stream.connect(port, ip);
 
-        // Hijack the emit method so that we can get in there and
-        // do any reconnection on errors, before raising it up the
-        // stack...
-        var oldEmit = redisClient.emit;
-        redisClient.emit = function(eventName) {
+            // Hijack the emit method so that we can get in there and
+            // do any reconnection on errors, before raising it up the
+            // stack...
+            var oldEmit = redisClient.emit;
+            redisClient.emit = function(eventName) {
 
-            // Has an error been hit?
-            if (eventName === 'error') {
-                hitError.apply(null, arguments);
-            } else {
-                // Not an error - call the real emit...
-                oldEmit.apply(redisClient, arguments);
+                // Has an error been hit?
+                if (eventName === 'error') {
+                    hitError.apply(null, arguments);
+                } else {
+                    // Not an error - call the real emit...
+                    oldEmit.apply(redisClient, arguments);
+                }
+            };
+
+            // Crude but may do for now. On error re-resolve the master
+            // and retry the connection
+            function hitError(eventName, err) {
+
+                var _args = arguments;
+                function reemit() {
+                    oldEmit.apply(redisClient, _args);
+                }
+
+                // If we are still connected then reraise the error - thats
+                // not what we are here to handle
+                if (redisClient.connected) { return reemit(); }
+
+                // In the background the client is going to keep trying to reconnect
+                // and this error will keep getting raised - lets just keep trying
+                // to get a new master...
+                resolveSlave(function(_err, ip, port) {
+                    if (_err) { oldEmit.call(redisClient, 'error', _err); }
+
+                    // Try and reconnect
+                    redisClient.port = port;
+                    redisClient.host = ip;
+                });
             }
-        };
+        });
+    }
+    else {
+        // Resolve the master redis server from the sentinel endpoints
+        resolveMaster(function(err, ip, port) {
+            if (err) { redisClient.emit('error', err); }
 
-        // Crude but may do for now. On error re-resolve the master
-        // and retry the connection
-        function hitError(eventName, err) {
+            redisClient.port = port;
+            redisClient.host = ip;
+            redisClient.stream.connect(port, ip);
 
-            var _args = arguments;
-            function reemit() {
-                oldEmit.apply(redisClient, _args);
+            // Hijack the emit method so that we can get in there and
+            // do any reconnection on errors, before raising it up the
+            // stack...
+            var oldEmit = redisClient.emit;
+            redisClient.emit = function(eventName) {
+
+                // Has an error been hit?
+                if (eventName === 'error') {
+                    hitError.apply(null, arguments);
+                } else {
+                    // Not an error - call the real emit...
+                    oldEmit.apply(redisClient, arguments);
+                }
+            };
+
+            // Crude but may do for now. On error re-resolve the master
+            // and retry the connection
+            function hitError(eventName, err) {
+
+                var _args = arguments;
+                function reemit() {
+                    oldEmit.apply(redisClient, _args);
+                }
+
+                // If we are still connected then reraise the error - thats
+                // not what we are here to handle
+                if (redisClient.connected) { return reemit(); }
+
+                // In the background the client is going to keep trying to reconnect
+                // and this error will keep getting raised - lets just keep trying
+                // to get a new master...
+                resolveMaster(function(_err, ip, port) {
+                    if (_err) { oldEmit.call(redisClient, 'error', _err); }
+
+                    // Try and reconnect
+                    redisClient.port = port;
+                    redisClient.host = ip;
+                });
             }
-
-            // If we are still connected then reraise the error - thats
-            // not what we are here to handle
-            if (redisClient.connected) { return reemit(); }
-
-            // In the background the client is going to keep trying to reconnect
-            // and this error will keep getting raised - lets just keep trying
-            // to get a new master...
-            resolveMaster(function(_err, ip, port) {
-                if (_err) { oldEmit.call(redisClient, 'error', _err); }
-
-                // Try and reconnect
-                redisClient.port = port;
-                redisClient.host = ip;
-            });
-        }
-    });
+        });
+    }
+    
 
     return redisClient;
 }
